@@ -24,9 +24,11 @@ var bucketRegex = regexp.MustCompile(`^[a-z0-9-]+$`)
 type Storage struct {
 	BaseDir            string
 	MaxBucketSizeBytes int64
-	locks              sync.Map // Map[string]*pathLock
-	bucketSizes        sync.Map // Map[string]*int64 for per-bucket sizes
-	inFlightBytes      int64    // Total bytes currently being streamed (cross-bucket)
+	FileMode           os.FileMode // Permission mode for created files
+	DirMode            os.FileMode // Permission mode for created directories
+	locks              sync.Map    // Map[string]*pathLock
+	bucketSizes        sync.Map    // Map[string]*int64 for per-bucket sizes
+	inFlightBytes      int64       // Total bytes currently being streamed (cross-bucket)
 }
 
 type pathLock struct {
@@ -292,7 +294,7 @@ func (s *Storage) handleUpload(w http.ResponseWriter, r *http.Request, path stri
 	}
 
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, s.DirMode); err != nil {
 		log.Printf("error creating directory %s: %v", dir, err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
@@ -306,6 +308,11 @@ func (s *Storage) handleUpload(w http.ResponseWriter, r *http.Request, path stri
 		return
 	}
 	tempName := tempFile.Name()
+
+	// Proactively set permissions before writing/renaming
+	if err := tempFile.Chmod(s.FileMode); err != nil {
+		log.Printf("warning: failed to chmod temp file %s: %v", tempName, err)
+	}
 
 	var success bool
 	defer func() {
@@ -376,7 +383,7 @@ func (s *Storage) handleUpload(w http.ResponseWriter, r *http.Request, path stri
 	}
 	success = true
 
-	// Persist Metadata (Content-Type)
+	// Persist Metadata (Content-Type) Atomically
 	contentType := r.Header.Get("Content-Type")
 	if contentType == "" {
 		contentType = "application/octet-stream"
@@ -384,8 +391,18 @@ func (s *Storage) handleUpload(w http.ResponseWriter, r *http.Request, path stri
 	contentType = strings.ReplaceAll(contentType, "\n", "")
 	contentType = strings.ReplaceAll(contentType, "\r", "")
 
-	if err := os.WriteFile(path+".meta", []byte(contentType), 0644); err != nil {
-		log.Printf("warning: error writing metadata for %s: %v", path, err)
+	metaPath := path + ".meta"
+	tempMeta, err := os.CreateTemp(dir, "meta-*")
+	if err == nil {
+		_ = tempMeta.Chmod(s.FileMode)
+		_, _ = tempMeta.Write([]byte(contentType))
+		_ = tempMeta.Close()
+		if err := os.Rename(tempMeta.Name(), metaPath); err != nil {
+			_ = os.Remove(tempMeta.Name())
+			log.Printf("warning: error writing metadata for %s: %v", path, err)
+		}
+	} else {
+		log.Printf("warning: error creating temp meta file: %v", err)
 	}
 
 	w.WriteHeader(http.StatusCreated)
@@ -482,23 +499,20 @@ func main() {
 		log.Fatalf("Failed to get absolute path for %s: %v", storageDir, err)
 	}
 
-	// Resolve any symlinks in the base directory once at startup
-	// This ensures consistency on systems like macOS where /var -> /private/var
-	resolvedDir, err := filepath.EvalSymlinks(absDir)
-	if err != nil {
-		// If it doesn't exist yet, we'll create it and then resolve it
-		if err := os.MkdirAll(absDir, 0755); err != nil {
-			log.Fatalf("Failed to create storage directory %s: %v", absDir, err)
-		}
-		resolvedDir, _ = filepath.EvalSymlinks(absDir)
-	}
-	if resolvedDir == "" {
-		resolvedDir = absDir
+	storage := &Storage{
+		BaseDir:            absDir,
+		MaxBucketSizeBytes: int64(maxSizeGB) * 1024 * 1024 * 1024,
+		FileMode:           os.FileMode(0666 &^ umask),
+		DirMode:            os.FileMode(0777 &^ umask),
 	}
 
-	storage := &Storage{
-		BaseDir:            resolvedDir,
-		MaxBucketSizeBytes: int64(maxSizeGB) * 1024 * 1024 * 1024,
+	// Resolve any symlinks and create base directory with proper modes
+	if err := os.MkdirAll(storage.BaseDir, storage.DirMode); err != nil {
+		log.Fatalf("Failed to create storage directory %s: %v", storage.BaseDir, err)
+	}
+	resolvedDir, err := filepath.EvalSymlinks(storage.BaseDir)
+	if err == nil && resolvedDir != "" {
+		storage.BaseDir = resolvedDir
 	}
 
 	// Performance 1: Initialize bucket sizes in memory

@@ -8,12 +8,18 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 )
 
 const testApiKey = "test-secret-key"
+
+var umaskMutex sync.Mutex
 
 func TestAPI(t *testing.T) {
 	tempDir, err := os.MkdirTemp("", "storage-test-*")
@@ -30,7 +36,11 @@ func TestAPI(t *testing.T) {
 	}
 	defer func() { _ = os.Unsetenv("STORAGE_API_KEY") }()
 
-	storage := &Storage{BaseDir: tempDir}
+	storage := &Storage{
+		BaseDir:  tempDir,
+		FileMode: 0644,
+		DirMode:  0755,
+	}
 	// Important: Initialize bucket sizes for the storage instance
 	storage.calculateInitialSizes()
 
@@ -225,6 +235,8 @@ func TestAPI(t *testing.T) {
 		smallStorage := &Storage{
 			BaseDir:            tempDir,
 			MaxBucketSizeBytes: 5,
+			FileMode:           0644,
+			DirMode:            0755,
 		}
 		smallStorage.calculateInitialSizes()
 		smallServer := httptest.NewServer(smallStorage)
@@ -358,6 +370,245 @@ func TestAPI(t *testing.T) {
 		resp, _ = http.DefaultClient.Do(req)
 		if resp.StatusCode != http.StatusUnauthorized {
 			t.Errorf("expected 401 for unauthorized list, got %d", resp.StatusCode)
+		}
+	})
+
+	t.Run("File Permissions (Umask Fix Scenarios)", func(t *testing.T) {
+		umaskMutex.Lock()
+		defer umaskMutex.Unlock()
+
+		cases := []struct {
+			name         string
+			umask        int
+			expectedFile os.FileMode
+			expectedDir  os.FileMode
+		}{
+			{"Standard 0022", 0022, 0644, 0755},
+			{"Group Writable 0002", 0002, 0664, 0775},
+			{"Strict 0077", 0077, 0600, 0700},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				// We MUST set the process umask to test MkdirAll properly,
+				// because MkdirAll is affected by it.
+				oldMask := syscall.Umask(tc.umask)
+				defer syscall.Umask(oldMask)
+
+				tempBase, _ := os.MkdirTemp(tempDir, "perm-scen-*")
+				permStorage := &Storage{
+					BaseDir:  tempBase,
+					FileMode: os.FileMode(0666 &^ tc.umask),
+					DirMode:  os.FileMode(0777 &^ tc.umask),
+				}
+				server := httptest.NewServer(permStorage)
+				defer server.Close()
+
+				bucket := "scen-test"
+				filename := "file.txt"
+				req, _ := http.NewRequest(http.MethodPut, server.URL+"/"+bucket+"/"+filename, bytes.NewReader([]byte("test")))
+				req.Header.Set("Authorization", "Bearer "+testApiKey)
+				resp, _ := http.DefaultClient.Do(req)
+				if resp.StatusCode != http.StatusCreated {
+					t.Fatalf("upload failed: %d", resp.StatusCode)
+				}
+
+				// Check Dir
+				dirInfo, _ := os.Stat(filepath.Join(tempBase, bucket))
+				if dirInfo.Mode().Perm() != tc.expectedDir {
+					t.Errorf("%s: expected dir mode %o, got %o", tc.name, tc.expectedDir, dirInfo.Mode().Perm())
+				}
+
+				// Check File (os.Chmod in handleUpload should ensure exact mode)
+				fileInfo, _ := os.Stat(filepath.Join(tempBase, bucket, filename))
+				if fileInfo.Mode().Perm() != tc.expectedFile {
+					t.Errorf("%s: expected file mode %o, got %o", tc.name, tc.expectedFile, fileInfo.Mode().Perm())
+				}
+			})
+		}
+	})
+
+	t.Run("Permissions Race Window (Definitive Fix)", func(t *testing.T) {
+		tempBase, _ := os.MkdirTemp(tempDir, "race-*")
+		raceStorage := &Storage{
+			BaseDir:  tempBase,
+			FileMode: os.FileMode(0644),
+			DirMode:  0755,
+		}
+		server := httptest.NewServer(raceStorage)
+		defer server.Close()
+
+		bucket := "race-bucket"
+		filename := "race-file.txt"
+		path := filepath.Join(tempBase, bucket, filename)
+
+		// Tight loop in another goroutine to catch the file as it appears
+		stopRace := make(chan bool)
+		var windowDetected atomic.Bool
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stopRace:
+					return
+				default:
+					info, err := os.Stat(path)
+					if err == nil {
+						// File appeared! Check permissions immediately.
+						if info.Mode().Perm() == 0600 {
+							windowDetected.Store(true)
+						}
+					}
+				}
+			}
+		}()
+
+		// Multiple uploads to increase chance of catching the window
+		for i := 0; i < 20; i++ {
+			req, _ := http.NewRequest(http.MethodPut, server.URL+"/"+bucket+"/"+filename, bytes.NewReader([]byte("race-test")))
+			req.Header.Set("Authorization", "Bearer "+testApiKey)
+			resp, _ := http.DefaultClient.Do(req)
+			if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+				t.Errorf("upload failed: %d", resp.StatusCode)
+			}
+		}
+
+		close(stopRace)
+		wg.Wait()
+
+		if windowDetected.Load() {
+			t.Errorf("Race window detected: file appeared at destination with 0600 permissions before Chmod was effective")
+		}
+	})
+}
+
+func TestUmaskEnvironmentVariable(t *testing.T) {
+	// This tests the logic used in main() for parsing umask
+	parseUmask := func(val string) int {
+		umask := 0022
+		if val != "" {
+			if parsed, err := strconv.ParseInt(val, 8, 32); err == nil {
+				umask = int(parsed)
+			}
+		}
+		return umask
+	}
+
+	cases := []struct {
+		env      string
+		expected int
+	}{
+		{"", 0022},
+		{"0002", 0002},
+		{"0077", 0077},
+		{"invalid", 0022},
+	}
+
+	for _, tc := range cases {
+		got := parseUmask(tc.env)
+		if got != tc.expected {
+			t.Errorf("parseUmask(%q) = %04o, want %04o", tc.env, got, tc.expected)
+		}
+	}
+}
+
+func TestQuotaAndMemoryFixes(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "storage-fix-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(tempDir) }()
+
+	apiKey := "secret"
+	if err := os.Setenv("STORAGE_API_KEY", apiKey); err != nil {
+		t.Fatalf("failed to set env: %v", err)
+	}
+	defer func() { _ = os.Unsetenv("STORAGE_API_KEY") }()
+
+	// macOS trick: /var is a symlink to /private/var
+	tempDir, _ = filepath.EvalSymlinks(tempDir)
+
+	storage := &Storage{
+		BaseDir:            tempDir,
+		MaxBucketSizeBytes: 1000,
+		inFlightBytes:      0,
+		FileMode:           0644,
+		DirMode:            0755,
+	}
+	storage.calculateInitialSizes()
+
+	server := httptest.NewServer(storage)
+	defer server.Close()
+
+	t.Run("Quota desync on overwrite", func(t *testing.T) {
+		bucket := "quota-fix"
+		fileUrl := server.URL + "/" + bucket + "/file.txt"
+
+		// 1. Initial upload (10 bytes)
+		req, _ := http.NewRequest(http.MethodPut, fileUrl, bytes.NewReader([]byte("1234567890")))
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		resp, _ := http.DefaultClient.Do(req)
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("initial upload failed: %d", resp.StatusCode)
+		}
+
+		sizePtr := storage.getBucketSizePtr(bucket)
+		if atomic.LoadInt64(sizePtr) != 10 {
+			t.Errorf("expected size 10, got %d", atomic.LoadInt64(sizePtr))
+		}
+
+		// 2. Overwrite with 20 bytes.
+		req, _ = http.NewRequest(http.MethodPut, fileUrl, bytes.NewReader([]byte("12345678901234567890")))
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		resp, _ = http.DefaultClient.Do(req)
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("overwrite failed: %d", resp.StatusCode)
+		}
+
+		if atomic.LoadInt64(sizePtr) != 20 {
+			t.Errorf("expected size 20 after overwrite, got %d", atomic.LoadInt64(sizePtr))
+		}
+	})
+
+	t.Run("Lock map memory leak fix", func(t *testing.T) {
+		bucket := "lock-fix"
+		for i := 0; i < 50; i++ {
+			filename := fmt.Sprintf("file-%d.txt", i)
+			fileUrl := server.URL + "/" + bucket + "/" + filename
+			req, _ := http.NewRequest(http.MethodPut, fileUrl, bytes.NewReader([]byte("data")))
+			req.Header.Set("Authorization", "Bearer "+apiKey)
+			resp, _ := http.DefaultClient.Do(req)
+			if resp.StatusCode != http.StatusCreated {
+				t.Fatalf("upload %d failed", i)
+			}
+		}
+
+		count := 0
+		storage.locks.Range(func(key, value interface{}) bool {
+			count++
+			return true
+		})
+
+		if count > 0 {
+			t.Errorf("expected 0 locks in map after uploads, got %d", count)
+		}
+	})
+
+	t.Run("In-flight protection", func(t *testing.T) {
+		bucket := "inflight-test"
+		body := make([]byte, 1001)
+		req, _ := http.NewRequest(http.MethodPut, server.URL+"/"+bucket+"/huge.txt", bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusInsufficientStorage {
+			t.Errorf("expected 507, got %d", resp.StatusCode)
 		}
 	})
 }

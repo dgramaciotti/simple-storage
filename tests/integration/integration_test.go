@@ -110,8 +110,26 @@ func TestIntegration(t *testing.T) {
 
 				// 3. Verify on Host FS (Volume Mount)
 				hostPath := filepath.Join(storageDir, bucket, filename)
-				if _, err := os.Stat(hostPath); os.IsNotExist(err) {
+				info, err := os.Stat(hostPath)
+				if os.IsNotExist(err) {
 					t.Errorf("File %s not found in host storage directory (Volume mount failure)", hostPath)
+				} else if err != nil {
+					t.Errorf("failed to stat host file %s: %v", hostPath, err)
+				} else {
+					// Verify permissions (0644 expected by default)
+					if info.Mode().Perm() != 0644 {
+						t.Errorf("expected host file mode 0644 for %s, got %o", filename, info.Mode().Perm())
+					}
+				}
+
+				// 4. Verify Meta File permissions
+				metaPath := hostPath + ".meta"
+				if metaInfo, err := os.Stat(metaPath); err == nil {
+					if metaInfo.Mode().Perm() != 0644 {
+						t.Errorf("expected host meta file mode 0644 for %s, got %o", filename, metaInfo.Mode().Perm())
+					}
+				} else if !os.IsNotExist(err) {
+					t.Errorf("failed to stat host meta file %s: %v", metaPath, err)
 				}
 			})
 		}
