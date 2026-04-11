@@ -10,9 +10,11 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -446,6 +448,15 @@ func (s *Storage) handleDelete(w http.ResponseWriter, r *http.Request, path stri
 }
 
 func main() {
+	// Set umask for file creation (default 0022 -> 644 files, 755 dirs)
+	umask := 0022
+	if val := os.Getenv("STORAGE_UMASK"); val != "" {
+		if parsed, err := strconv.ParseInt(val, 8, 32); err == nil {
+			umask = int(parsed)
+		}
+	}
+	syscall.Umask(umask)
+
 	storageDir := os.Getenv("STORAGE_DIR")
 	if storageDir == "" {
 		storageDir = "./storage"
@@ -501,7 +512,7 @@ func main() {
 	}
 	_ = os.Remove(testFile)
 
-	log.Printf("Starting storage service on port %s, data dir: %s, Max Bucket Size: %dGB", port, resolvedDir, maxSizeGB)
+	log.Printf("Starting storage service on port %s, data dir: %s, Max Bucket Size: %dGB, Umask: %04o", port, resolvedDir, maxSizeGB, umask)
 	if err := http.ListenAndServe(":"+port, storage); err != nil {
 		log.Fatal(err)
 	}
