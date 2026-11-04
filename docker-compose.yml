@@ -2,7 +2,7 @@ services:
   storage-service:
     build: .
     ports:
-      - "8080:8080"
+      - "${HOST_PORT:-8080}:8080"
     environment:
       - STORAGE_API_KEY=my-secure-key
       - STORAGE_DIR=/data

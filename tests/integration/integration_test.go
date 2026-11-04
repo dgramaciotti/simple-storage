@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -35,6 +36,10 @@ const (
 )
 
 func TestIntegration(t *testing.T) {
+	baseURL := baseURL
+	if port := os.Getenv("HOST_PORT"); port != "" {
+		baseURL = "http://127.0.0.1:" + port
+	}
 	client := &http.Client{}
 
 	t.Run("Health Check", func(t *testing.T) {
@@ -210,6 +215,84 @@ func TestIntegration(t *testing.T) {
 		}
 		if !foundBucket {
 			t.Errorf("bucket %s not found in list", bucket)
+		}
+	})
+
+	t.Run("Security Regressions (Upload-Prefix, Directory Ops, Symlink Jailing)", func(t *testing.T) {
+		bucket := "sec-integration"
+
+		// 1. Upload a legitimate file prefixed with "upload-"
+		uploadKey := "upload-statement.pdf"
+		content := []byte("statement-content")
+		req, _ := http.NewRequest(http.MethodPut, baseURL+"/"+bucket+"/"+uploadKey, bytes.NewReader(content))
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		resp, err := client.Do(req)
+		if err != nil || resp.StatusCode != http.StatusCreated {
+			t.Fatalf("upload failed: %v, status: %d", err, resp.StatusCode)
+		}
+		_ = resp.Body.Close()
+
+		// Verify "upload-statement.pdf" appears in GET /list
+		req, _ = http.NewRequest(http.MethodGet, baseURL+"/list", nil)
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		resp, err = client.Do(req)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			t.Fatalf("list failed: %v, status: %d", err, resp.StatusCode)
+		}
+		var listResp ListResponse
+		if err := json.NewDecoder(resp.Body).Decode(&listResp); err != nil {
+			t.Fatalf("failed to decode list response: %v", err)
+		}
+		_ = resp.Body.Close()
+
+		foundUploadFile := false
+		for _, b := range listResp.Buckets {
+			if b.Name == bucket {
+				for _, f := range b.Files {
+					if f.Key == uploadKey {
+						foundUploadFile = true
+					}
+				}
+			}
+		}
+		if !foundUploadFile {
+			t.Errorf("legitimate file %q missing from /list", uploadKey)
+		}
+
+		// 2. Upload nested file and verify GET/DELETE on the subdirectory are rejected
+		nestedURL := baseURL + "/" + bucket + "/nested/doc.txt"
+		req, _ = http.NewRequest(http.MethodPut, nestedURL, bytes.NewReader([]byte("nested")))
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		resp, err = client.Do(req)
+		if err != nil || resp.StatusCode != http.StatusCreated {
+			t.Fatalf("nested upload failed: %v", err)
+		}
+		_ = resp.Body.Close()
+
+		// GET on subdirectory "/nested" must not expose HTML directory listing or .meta files
+		dirURL := baseURL + "/" + bucket + "/nested"
+		req, _ = http.NewRequest(http.MethodGet, dirURL, nil)
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		resp, err = client.Do(req)
+		if err != nil {
+			t.Fatalf("GET on directory failed: %v", err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode == http.StatusOK || strings.Contains(string(body), ".meta") {
+			t.Errorf("GET on subdirectory exposed directory listing (status %d): %s", resp.StatusCode, string(body))
+		}
+
+		// DELETE on subdirectory "/nested" must be rejected with 400 Bad Request
+		req, _ = http.NewRequest(http.MethodDelete, dirURL, nil)
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		resp, err = client.Do(req)
+		if err != nil {
+			t.Fatalf("DELETE on directory failed: %v", err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("expected 400 Bad Request when deleting a directory, got %d", resp.StatusCode)
 		}
 	})
 

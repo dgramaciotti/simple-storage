@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 )
 
 const testApiKey = "test-secret-key"
@@ -570,6 +571,17 @@ func TestQuotaAndMemoryFixes(t *testing.T) {
 		if atomic.LoadInt64(sizePtr) != 20 {
 			t.Errorf("expected size 20 after overwrite, got %d", atomic.LoadInt64(sizePtr))
 		}
+
+		// 3. Overwrite up to full bucket capacity (1000 bytes)
+		req, _ = http.NewRequest(http.MethodPut, fileUrl, bytes.NewReader(bytes.Repeat([]byte("a"), 1000)))
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		resp, _ = http.DefaultClient.Do(req)
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("overwrite to full capacity failed: %d", resp.StatusCode)
+		}
+		if atomic.LoadInt64(sizePtr) != 1000 {
+			t.Errorf("expected size 1000 after full capacity overwrite, got %d", atomic.LoadInt64(sizePtr))
+		}
 	})
 
 	t.Run("Lock map memory leak fix", func(t *testing.T) {
@@ -609,6 +621,234 @@ func TestQuotaAndMemoryFixes(t *testing.T) {
 		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode != http.StatusInsufficientStorage {
 			t.Errorf("expected 507, got %d", resp.StatusCode)
+		}
+	})
+}
+
+func TestVulnerabilityRegressions(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "storage-vuln-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(tempDir) }()
+
+	tempDir, _ = filepath.EvalSymlinks(tempDir)
+
+	apiKey := "secret"
+	if err := os.Setenv("STORAGE_API_KEY", apiKey); err != nil {
+		t.Fatalf("failed to set env: %v", err)
+	}
+	defer func() { _ = os.Unsetenv("STORAGE_API_KEY") }()
+
+	storage := &Storage{
+		BaseDir:            tempDir,
+		MaxBucketSizeBytes: 1000,
+		FileMode:           0644,
+		DirMode:            0755,
+	}
+	storage.calculateInitialSizes()
+
+	server := httptest.NewServer(storage)
+	defer server.Close()
+
+	t.Run("1. Legitimate upload-* files must not be hidden or deleted on restart", func(t *testing.T) {
+		bucket := "docs"
+		key := "upload-invoice.pdf"
+		content := []byte("important-invoice-data")
+
+		// Upload legitimate file starting with "upload-"
+		req, _ := http.NewRequest(http.MethodPut, server.URL+"/"+bucket+"/"+key, bytes.NewReader(content))
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil || resp.StatusCode != http.StatusCreated {
+			t.Fatalf("upload failed: %v, status: %d", err, resp.StatusCode)
+		}
+		_ = resp.Body.Close()
+
+		// 1a. Verify file appears in GET /list
+		req, _ = http.NewRequest(http.MethodGet, server.URL+"/list", nil)
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		resp, err = http.DefaultClient.Do(req)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			t.Fatalf("list failed: %v", err)
+		}
+		var listResp ListResponse
+		_ = json.NewDecoder(resp.Body).Decode(&listResp)
+		_ = resp.Body.Close()
+
+		found := false
+		for _, b := range listResp.Buckets {
+			if b.Name == bucket {
+				for _, f := range b.Files {
+					if f.Key == key {
+						found = true
+					}
+				}
+			}
+		}
+		if !found {
+			t.Errorf("file %q was hidden from /list response", key)
+		}
+
+		// 1b. Simulate service restart cleanup (calculateInitialSizes)
+		storage.calculateInitialSizes()
+
+		// Verify file was NOT deleted by startup cleanup
+		req, _ = http.NewRequest(http.MethodGet, server.URL+"/"+bucket+"/"+key, nil)
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		resp, err = http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("get request failed: %v", err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("file %q was deleted on startup cleanup! got status %d", key, resp.StatusCode)
+		}
+	})
+
+	t.Run("2. Deleting a subdirectory must not underflow bucket quota", func(t *testing.T) {
+		bucket := "quota-underflow"
+		fileURL := server.URL + "/" + bucket + "/sub/item.txt"
+
+		// Upload 10-byte file in subdirectory
+		req, _ := http.NewRequest(http.MethodPut, fileURL, bytes.NewReader([]byte("0123456789")))
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		resp, _ := http.DefaultClient.Do(req)
+		_ = resp.Body.Close()
+
+		// Delete the file -> bucket size should be 0
+		req, _ = http.NewRequest(http.MethodDelete, fileURL, nil)
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		resp, _ = http.DefaultClient.Do(req)
+		_ = resp.Body.Close()
+
+		sizePtr := storage.getBucketSizePtr(bucket)
+		if got := atomic.LoadInt64(sizePtr); got != 0 {
+			t.Fatalf("expected bucket size 0 after file delete, got %d", got)
+		}
+
+		// Attempt to DELETE the empty subdirectory "/sub"
+		dirURL := server.URL + "/" + bucket + "/sub"
+		req, _ = http.NewRequest(http.MethodDelete, dirURL, nil)
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		resp, _ = http.DefaultClient.Do(req)
+		_ = resp.Body.Close()
+
+		if got := atomic.LoadInt64(sizePtr); got < 0 {
+			t.Errorf("bucket quota underflowed to negative value after directory DELETE: %d", got)
+		}
+	})
+
+	t.Run("3. GET on a subdirectory must not expose HTML directory listing", func(t *testing.T) {
+		bucket := "dir-listing"
+		fileURL := server.URL + "/" + bucket + "/nested/secret.txt"
+
+		req, _ := http.NewRequest(http.MethodPut, fileURL, bytes.NewReader([]byte("secret")))
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		resp, _ := http.DefaultClient.Do(req)
+		_ = resp.Body.Close()
+
+		// Request the directory path itself
+		dirURL := server.URL + "/" + bucket + "/nested"
+		req, _ = http.NewRequest(http.MethodGet, dirURL, nil)
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+
+		if resp.StatusCode == http.StatusOK || strings.Contains(string(body), ".meta") {
+			t.Errorf("GET on subdirectory exposed directory listing (status %d): %s", resp.StatusCode, string(body))
+		}
+	})
+
+	t.Run("4. Chunked uploads (ContentLength -1) must track in-flight bytes", func(t *testing.T) {
+		chunkStorage := &Storage{
+			BaseDir:            tempDir,
+			MaxBucketSizeBytes: 50,
+			FileMode:           0644,
+			DirMode:            0755,
+		}
+		chunkServer := httptest.NewServer(chunkStorage)
+		defer chunkServer.Close()
+
+		pr, pw := io.Pipe()
+		written40 := make(chan struct{})
+		uploadDone := make(chan struct{})
+
+		go func() {
+			defer close(uploadDone)
+			// Wrapping pr in io.NopCloser hides size so ContentLength is -1 (chunked)
+			req, _ := http.NewRequest(http.MethodPut, chunkServer.URL+"/chunk-bkt/stream1.bin", io.NopCloser(pr))
+			req.ContentLength = -1
+			req.Header.Set("Authorization", "Bearer "+apiKey)
+			resp, err := http.DefaultClient.Do(req)
+			if err == nil && resp != nil {
+				_ = resp.Body.Close()
+			}
+		}()
+
+		// Stream 40 bytes into the first upload and keep the stream open
+		go func() {
+			_, _ = pw.Write(bytes.Repeat([]byte("x"), 40))
+			close(written40)
+		}()
+		<-written40
+
+		// Wait for the server handler to receive the 40 chunked bytes
+		deadline := time.Now().Add(500 * time.Millisecond)
+		for atomic.LoadInt64(&chunkStorage.inFlightBytes) < 40 && time.Now().Before(deadline) {
+			time.Sleep(2 * time.Millisecond)
+		}
+
+		// Now send a second upload of 20 bytes (40 in-flight + 20 = 60 > 50 quota)
+		req2, _ := http.NewRequest(http.MethodPut, chunkServer.URL+"/chunk-bkt/stream2.bin", bytes.NewReader(bytes.Repeat([]byte("y"), 20)))
+		req2.Header.Set("Authorization", "Bearer "+apiKey)
+		resp2, err := http.DefaultClient.Do(req2)
+		if err != nil {
+			t.Fatalf("second upload request failed: %v", err)
+		}
+		_ = resp2.Body.Close()
+
+		_ = pw.Close()
+		<-uploadDone
+
+		if resp2.StatusCode != http.StatusInsufficientStorage {
+			t.Errorf("expected 507 Insufficient Storage while chunked upload was in-flight, got %d", resp2.StatusCode)
+		}
+	})
+
+	t.Run("5. Symlink prefix and parent-directory escape jailing", func(t *testing.T) {
+		// Create two sibling buckets where one is a prefix of the other: "app" and "app-secret"
+		appDir := filepath.Join(tempDir, "app")
+		secretDir := filepath.Join(tempDir, "app-secret")
+		_ = os.MkdirAll(appDir, 0755)
+		_ = os.MkdirAll(secretDir, 0755)
+
+		secretFile := filepath.Join(secretDir, "secret.txt")
+		_ = os.WriteFile(secretFile, []byte("top-secret"), 0644)
+
+		// 5a. File symlink in "app" pointing to sibling bucket "app-secret/secret.txt"
+		_ = os.Symlink(secretFile, filepath.Join(appDir, "leak.txt"))
+
+		req, _ := http.NewRequest(http.MethodGet, server.URL+"/app/leak.txt", nil)
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		resp, _ := http.DefaultClient.Do(req)
+		_ = resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			t.Errorf("cross-bucket symlink escape succeeded via prefix match (status 200 OK)")
+		}
+
+		// 5b. Directory symlink in "app" pointing to "app-secret", uploading a new leaf file
+		_ = os.Symlink(secretDir, filepath.Join(appDir, "symdir"))
+		req, _ = http.NewRequest(http.MethodPut, server.URL+"/app/symdir/pwned.txt", bytes.NewReader([]byte("overwrite")))
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		resp, _ = http.DefaultClient.Do(req)
+		_ = resp.Body.Close()
+		if resp.StatusCode == http.StatusCreated {
+			t.Errorf("symlinked parent directory escape succeeded on PUT (status 201 Created)")
 		}
 	})
 }

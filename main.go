@@ -140,26 +140,19 @@ func (s *Storage) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	bucketDir := filepath.Join(resolvedBase, bucket)
+	if resolvedBucketDir, err := filepath.EvalSymlinks(bucketDir); err == nil {
+		bucketDir = resolvedBucketDir
+	}
 	fullPath := filepath.Join(bucketDir, cleanKey)
 
-	// Important: For existent files, resolve them to catch symlink escapes.
-	// For non-existent files (PUT), checking the clean path prefix is sufficient
-	// since the bucket name itself is restricted to not contains symlinks.
-	if _, err := os.Lstat(fullPath); err == nil {
-		resolvedFull, err := filepath.EvalSymlinks(fullPath)
-		if err == nil {
-			if !strings.HasPrefix(resolvedFull, bucketDir) {
-				http.Error(w, "Forbidden: Symlink escape detected", http.StatusForbidden)
-				return
-			}
-			fullPath = resolvedFull
-		}
-	}
-
-	if !strings.HasPrefix(fullPath, bucketDir) {
-		http.Error(w, "Forbidden: Path escape detected", http.StatusForbidden)
+	// Important: Resolve the deepest existing ancestor (or the file itself)
+	// to catch symlink escapes on both existing files and non-existent leaf paths (PUT).
+	resolvedFull, err := evalSymlinksWithMissingLeaf(fullPath)
+	if err != nil || !isWithinDir(resolvedFull, bucketDir) {
+		http.Error(w, "Forbidden: Symlink or path escape detected", http.StatusForbidden)
 		return
 	}
+	fullPath = resolvedFull
 
 	switch r.Method {
 	case http.MethodPut:
@@ -170,6 +163,37 @@ func (s *Storage) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleDelete(w, r, fullPath)
 	default:
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func isWithinDir(targetPath, baseDir string) bool {
+	rel, err := filepath.Rel(baseDir, targetPath)
+	if err != nil {
+		return false
+	}
+	return rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
+}
+
+func evalSymlinksWithMissingLeaf(fullPath string) (string, error) {
+	curr := fullPath
+	var missingParts []string
+	for {
+		if _, err := os.Lstat(curr); err == nil {
+			resolved, err := filepath.EvalSymlinks(curr)
+			if err != nil {
+				return "", err
+			}
+			for i := len(missingParts) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, missingParts[i])
+			}
+			return resolved, nil
+		}
+		parent := filepath.Dir(curr)
+		if parent == curr {
+			return fullPath, nil
+		}
+		missingParts = append(missingParts, filepath.Base(curr))
+		curr = parent
 	}
 }
 
@@ -224,8 +248,8 @@ func (s *Storage) handleList(w http.ResponseWriter, r *http.Request) {
 			}
 
 			name := info.Name()
-			// Skip meta files and temp files
-			if strings.HasSuffix(name, ".meta") || strings.HasPrefix(name, "upload-") {
+			// Skip meta files and temp files (which end with .tmp.meta)
+			if strings.HasSuffix(strings.ToLower(name), ".meta") {
 				return nil
 			}
 
@@ -264,6 +288,39 @@ func (s *Storage) handleList(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+var errQuotaExceeded = fmt.Errorf("quota exceeded")
+
+type inFlightTrackingReader struct {
+	ctx        io.Reader
+	reqCtx     func() error
+	storage    *Storage
+	sizePtr    *int64
+	oldSize    int64
+	trackDelta bool
+	tracked    int64
+}
+
+func (r *inFlightTrackingReader) Read(p []byte) (int, error) {
+	if err := r.reqCtx(); err != nil {
+		return 0, err
+	}
+	n, err := r.ctx.Read(p)
+	if n > 0 && r.trackDelta {
+		inFlight := atomic.AddInt64(&r.storage.inFlightBytes, int64(n))
+		r.tracked += int64(n)
+		if r.storage.MaxBucketSizeBytes > 0 && r.sizePtr != nil {
+			effectiveCurrent := atomic.LoadInt64(r.sizePtr) - r.oldSize
+			if effectiveCurrent < 0 {
+				effectiveCurrent = 0
+			}
+			if effectiveCurrent+inFlight > r.storage.MaxBucketSizeBytes {
+				return n, errQuotaExceeded
+			}
+		}
+	}
+	return n, err
+}
+
 func (s *Storage) handleUpload(w http.ResponseWriter, r *http.Request, path string) {
 	// Limit individual body size to 100MB
 	const maxUploadSize = 100 * 1024 * 1024
@@ -276,18 +333,42 @@ func (s *Storage) handleUpload(w http.ResponseWriter, r *http.Request, path stri
 	defer mu.Unlock()
 	defer s.releasePathLock(path)
 
+	var oldSize int64
+	if existingInfo, err := os.Stat(path); err == nil {
+		if existingInfo.IsDir() {
+			http.Error(w, "Bad Request: target path is a directory", http.StatusBadRequest)
+			return
+		}
+		oldSize = existingInfo.Size()
+	}
+
 	// Identify bucket for quota: should be the first component of the relative path
-	rel, _ := filepath.Rel(s.BaseDir, path)
+	baseDir := s.BaseDir
+	if resolvedBase, err := filepath.EvalSymlinks(s.BaseDir); err == nil {
+		baseDir = resolvedBase
+	}
+	rel, _ := filepath.Rel(baseDir, path)
 	bucketName := strings.Split(filepath.ToSlash(rel), "/")[0]
+	var sizePtr *int64
+	if s.MaxBucketSizeBytes > 0 {
+		sizePtr = s.getBucketSizePtr(bucketName)
+	}
 
 	// 2. Strict Quota and In-Flight Check
 	if s.MaxBucketSizeBytes > 0 {
-		sizePtr := s.getBucketSizePtr(bucketName)
 		currentSize := atomic.LoadInt64(sizePtr)
+		effectiveCurrent := currentSize - oldSize
+		if effectiveCurrent < 0 {
+			effectiveCurrent = 0
+		}
 		inFlight := atomic.LoadInt64(&s.inFlightBytes)
 
-		// Conservative check: if current + in-flight > capacity, reject to prevent disk exhaustion
-		if currentSize+inFlight >= s.MaxBucketSizeBytes {
+		// Conservative check: if current + in-flight >= capacity, reject to prevent disk exhaustion
+		if effectiveCurrent+inFlight >= s.MaxBucketSizeBytes {
+			http.Error(w, "Insufficient Storage: bucket quota reached or pending uploads", http.StatusInsufficientStorage)
+			return
+		}
+		if r.ContentLength > 0 && effectiveCurrent+inFlight+r.ContentLength > s.MaxBucketSizeBytes {
 			http.Error(w, "Insufficient Storage: bucket quota reached or pending uploads", http.StatusInsufficientStorage)
 			return
 		}
@@ -300,8 +381,8 @@ func (s *Storage) handleUpload(w http.ResponseWriter, r *http.Request, path stri
 		return
 	}
 
-	// Atomic Write: Create a temporary file in the same directory
-	tempFile, err := os.CreateTemp(dir, "upload-*")
+	// Atomic Write: Create a temporary file in the same directory using a protected .tmp.meta suffix
+	tempFile, err := os.CreateTemp(dir, ".upload-*.tmp.meta")
 	if err != nil {
 		log.Printf("error creating temp file: %v", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
@@ -322,47 +403,41 @@ func (s *Storage) handleUpload(w http.ResponseWriter, r *http.Request, path stri
 		}
 	}()
 
-	// Copy data while tracking in-flight bytes
-	errCh := make(chan error, 1)
-	var written int64
-	go func() {
-		// We use a custom writer that updates inFlightBytes
-		n, err := io.Copy(tempFile, r.Body)
-		written = n
-		errCh <- err
-	}()
-
-	// Simple in-flight tracking (approximate for the stream duration)
-	// For 100% precision we'd wrap the Body reader to increment/decrement.
-	// Here we'll treat the Content-Length as 'in-flight' if known.
 	if r.ContentLength > 0 {
 		atomic.AddInt64(&s.inFlightBytes, r.ContentLength)
 		defer atomic.AddInt64(&s.inFlightBytes, -r.ContentLength)
 	}
 
-	select {
-	case <-r.Context().Done():
-		http.Error(w, "Request Timeout/Disconnected", http.StatusRequestTimeout)
-		return
-	case err := <-errCh:
-		if err != nil {
-			if strings.Contains(err.Error(), "too large") {
-				http.Error(w, "Payload Too Large", http.StatusRequestEntityTooLarge)
-			} else {
-				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-			}
-			return
+	trackingReader := &inFlightTrackingReader{
+		ctx:        r.Body,
+		reqCtx:     r.Context().Err,
+		storage:    s,
+		sizePtr:    sizePtr,
+		oldSize:    oldSize,
+		trackDelta: r.ContentLength <= 0,
+	}
+	defer func() {
+		if trackingReader.tracked > 0 {
+			atomic.AddInt64(&s.inFlightBytes, -trackingReader.tracked)
 		}
+	}()
+
+	written, err := io.Copy(tempFile, trackingReader)
+	if err != nil {
+		if r.Context().Err() != nil {
+			http.Error(w, "Request Timeout/Disconnected", http.StatusRequestTimeout)
+		} else if err == errQuotaExceeded {
+			http.Error(w, "Insufficient Storage: bucket quota exceeded", http.StatusInsufficientStorage)
+		} else if strings.Contains(err.Error(), "too large") {
+			http.Error(w, "Payload Too Large", http.StatusRequestEntityTooLarge)
+		} else {
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		}
+		return
 	}
 
 	// 3. Quota Update with Overwrite Correction
-	var oldSize int64
-	if info, err := os.Stat(path); err == nil {
-		oldSize = info.Size()
-	}
-
 	if s.MaxBucketSizeBytes > 0 {
-		sizePtr := s.getBucketSizePtr(bucketName)
 		// delta = new piece - old piece
 		delta := written - oldSize
 		newSize := atomic.AddInt64(sizePtr, delta)
@@ -392,7 +467,7 @@ func (s *Storage) handleUpload(w http.ResponseWriter, r *http.Request, path stri
 	contentType = strings.ReplaceAll(contentType, "\r", "")
 
 	metaPath := path + ".meta"
-	tempMeta, err := os.CreateTemp(dir, "meta-*")
+	tempMeta, err := os.CreateTemp(dir, ".meta-*.tmp.meta")
 	if err == nil {
 		_ = tempMeta.Chmod(s.FileMode)
 		_, _ = tempMeta.Write([]byte(contentType))
@@ -410,6 +485,20 @@ func (s *Storage) handleUpload(w http.ResponseWriter, r *http.Request, path stri
 }
 
 func (s *Storage) handleDownload(w http.ResponseWriter, r *http.Request, path string) {
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			http.Error(w, "Not Found", http.StatusNotFound)
+		} else {
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		}
+		return
+	}
+	if info.IsDir() {
+		http.Error(w, "Not Found", http.StatusNotFound)
+		return
+	}
+
 	// 1. Restore Metadata if present (sanitized in handleUpload)
 	if meta, err := os.ReadFile(path + ".meta"); err == nil {
 		contentType := string(meta)
@@ -425,7 +514,11 @@ func (s *Storage) handleDownload(w http.ResponseWriter, r *http.Request, path st
 
 func (s *Storage) handleDelete(w http.ResponseWriter, r *http.Request, path string) {
 	// Identify bucket and path for locking and quota update
-	rel, _ := filepath.Rel(s.BaseDir, path)
+	baseDir := s.BaseDir
+	if resolvedBase, err := filepath.EvalSymlinks(s.BaseDir); err == nil {
+		baseDir = resolvedBase
+	}
+	rel, _ := filepath.Rel(baseDir, path)
 	parts := strings.Split(rel, string(filepath.Separator))
 	bucketName := ""
 	if len(parts) > 0 {
@@ -438,12 +531,21 @@ func (s *Storage) handleDelete(w http.ResponseWriter, r *http.Request, path stri
 	defer mu.Unlock()
 	defer s.releasePathLock(path)
 
-	// Get file info before deletion to update quota
+	// Get file info before deletion to update quota and prevent directory deletion
 	info, err := os.Stat(path)
-	fileSize := int64(0)
-	if err == nil {
-		fileSize = info.Size()
+	if err != nil {
+		if os.IsNotExist(err) {
+			http.Error(w, "Not Found", http.StatusNotFound)
+		} else {
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		}
+		return
 	}
+	if info.IsDir() {
+		http.Error(w, "Bad Request: cannot delete directory", http.StatusBadRequest)
+		return
+	}
+	fileSize := info.Size()
 
 	// Remove both object and metadata
 	_ = os.Remove(path + ".meta")
@@ -561,14 +663,15 @@ func (s *Storage) getDirSizeAndCleanup(path string) (int64, error) {
 		}
 
 		name := info.Name()
+		lowerName := strings.ToLower(name)
 		// Cleanup orphan temp files from previous crashes
-		if strings.HasPrefix(name, "upload-") {
+		if strings.HasSuffix(lowerName, ".tmp.meta") {
 			_ = os.Remove(fpath)
 			return nil
 		}
 
 		// Don't count .meta files in quota
-		if !strings.HasSuffix(name, ".meta") {
+		if !strings.HasSuffix(lowerName, ".meta") {
 			size += info.Size()
 		}
 		return nil
